@@ -1,0 +1,50 @@
+{
+  "name": "google-ads-mcp-server",
+  "version": "1.0.0",
+  "description": "Read-only Google Ads MCP server over streamable HTTP, for Claude custom connectors.",
+  "type": "module",
+  "main": "dist/http.js",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/http.js",
+    "dev": "tsx src/http.ts",
+    "setup-auth": "tsx src/setup-auth.ts"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-ads",
+    "gaql",
+    "ppc",
+    "claude"
+  ],
+  "author": "Matt Caldwell",
+  "contributors": [
+    "Sofian Bettayeb (original gsc-mcp-server, https://github.com/sofianbettayeb/gsc-mcp-server)"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "express": "^5.1.0",
+    "google-auth-library": "^11.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ccsmatt/google-ads-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ccsmatt/google-ads-mcp-server/issues"
+  },
+  "homepage": "https://github.com/ccsmatt/google-ads-mcp-server#readme"
+}
