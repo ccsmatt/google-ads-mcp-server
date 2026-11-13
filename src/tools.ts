@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AdsClient, Row, friendlyAdsError } from "./ads-client.js";
+import { AdsClient, GoogleAdsApiError, Row, friendlyAdsError } from "./ads-client.js";
 import { normalizeCustomerId } from "./auth.js";
 
 const DEFAULT_ROW_LIMIT = 100;
@@ -60,7 +60,9 @@ const campaignIdSchema = z
   .optional();
 
 export const listAccountsSchema = z.object({
+  name_filter: z.string().trim().min(1).optional(),
   include_inactive: z.boolean().optional().default(false),
+  limit: limitSchema,
 });
 
 export const runGaqlSchema = z.object({
@@ -126,6 +128,16 @@ export const conversionBreakdownSchema = z.object({
   limit: limitSchema,
 });
 
+export const searchCampaignsSchema = z.object({
+  name_pattern: z.string().min(1).max(500),
+  start_date: isoDate,
+  end_date: isoDate,
+  min_cost: z.number().min(0).optional().default(0),
+  status: z.array(z.enum(STATUSES)).optional(),
+  customer_ids: z.array(customerIdSchema).max(500).optional(),
+  limit: limitSchema,
+});
+
 const customerIdJsonSchema = { type: "string", description: CUSTOMER_ID_DESCRIPTION };
 
 const limitJsonSchema = {
@@ -159,13 +171,22 @@ export const TOOL_DEFINITIONS = [
   {
     name: "list_accounts",
     description:
-      "List the Google Ads client accounts under the manager (MCC) account, with customer ID, name, currency, time zone and status. Call this first when you don't know the customer ID, or to match a client name to an account.",
+      "List the Google Ads client accounts under the manager (MCC) account, with customer ID, name, currency, time zone and status. Call this first when you don't know the customer ID. The MCC has hundreds of accounts, so pass name_filter (part of the client's name) to find a specific one instead of listing them all.",
     inputSchema: {
       type: "object" as const,
       properties: {
+        name_filter: {
+          type: "string",
+          description:
+            'Case-insensitive text to look for in the account name or customer ID, e.g. "smith plumbing" or "4267". Words are matched separately, so "smith plumb" finds "Smith & Sons Plumbing".',
+        },
         include_inactive: {
           type: "boolean",
           description: "Also include cancelled, suspended and closed accounts (default false)",
+        },
+        limit: {
+          type: "integer",
+          description: `Maximum accounts to return (default ${DEFAULT_ROW_LIMIT}, max ${MAX_ROW_LIMIT}). account_count always gives the full number of matches.`,
         },
       },
       required: [],
@@ -307,6 +328,35 @@ Example: SELECT campaign.name, metrics.clicks, metrics.cost_micros FROM campaign
         limit: limitJsonSchema,
       },
       required: ["customer_id"],
+    },
+  },
+  {
+    name: "search_campaigns",
+    description:
+      "Find campaigns by name across many client accounts at once, e.g. every Christmas/holiday campaign in the MCC and what each spent. Matches a case-insensitive regex against campaign names in every enabled, non-manager account under the MCC (or only the given customer_ids), and returns one list sorted by cost with account, campaign, status, cost, clicks, conversions and cost per conversion. Only campaigns that spent more than min_cost in the date range are returned. Accounts that fail are reported in the summary without failing the whole search.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name_pattern: {
+          type: "string",
+          description:
+            'Case-insensitive regular expression (RE2 syntax) matched anywhere in the campaign name, e.g. "christmas|holiday" or "black ?friday". Lookarounds and backreferences are not supported.',
+        },
+        start_date: { type: "string", description: "Start date, YYYY-MM-DD" },
+        end_date: { type: "string", description: "End date, YYYY-MM-DD, inclusive" },
+        min_cost: {
+          type: "number",
+          description: "Only campaigns whose cost in the date range is greater than this (account currency, default 0)",
+        },
+        status: statusJsonSchema("campaigns"),
+        customer_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Only search these customer IDs. Default: every ENABLED, non-manager client account under the MCC.",
+        },
+        limit: limitJsonSchema,
+      },
+      required: ["name_pattern", "start_date", "end_date"],
     },
   },
 ];
@@ -497,6 +547,117 @@ async function lookupNames(
   return names;
 }
 
+interface ClientAccount {
+  customer_id: string;
+  name: string;
+  currency: string;
+  time_zone: string;
+  status: string;
+  is_manager: boolean;
+  level: number;
+  test_account: boolean;
+}
+
+/**
+ * Client accounts under the MCC (customer_client), excluding the MCC itself,
+ * sorted by name.
+ */
+async function listClientAccounts(
+  client: AdsClient,
+  includeInactive: boolean
+): Promise<{ accounts: ClientAccount[]; truncated: boolean }> {
+  const mcc = client.loginCustomerId;
+  const where = includeInactive ? "" : " WHERE customer_client.status = 'ENABLED'";
+  const { rows, truncated } = await client.search(
+    mcc,
+    `SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.time_zone, customer_client.status, customer_client.manager, customer_client.level, customer_client.test_account FROM customer_client${where}`,
+    10_000
+  );
+  const accounts = rows
+    .map((r) => ({
+      customer_id: String(r["customerClient.id"] ?? ""),
+      name: String(r["customerClient.descriptiveName"] ?? ""),
+      currency: String(r["customerClient.currencyCode"] ?? ""),
+      time_zone: String(r["customerClient.timeZone"] ?? ""),
+      status: String(r["customerClient.status"] ?? ""),
+      is_manager: Boolean(r["customerClient.manager"] ?? false),
+      level: Number(r["customerClient.level"] ?? 0),
+      test_account: Boolean(r["customerClient.testAccount"] ?? false),
+    }))
+    .filter((a) => a.customer_id !== mcc)
+    // Unnamed accounts last, so they don't fill the first page
+    .sort((a, b) => Number(!a.name) - Number(!b.name) || a.name.localeCompare(b.name));
+  return { accounts, truncated };
+}
+
+const SEARCH_CONCURRENCY = 10;
+const MAX_RETRIES = 4;
+
+function isRateLimited(error: unknown): boolean {
+  return (
+    error instanceof GoogleAdsApiError &&
+    (error.httpStatus === 429 ||
+      error.status === "RESOURCE_EXHAUSTED" ||
+      error.codes.some((c) => c.startsWith("quotaError") || c.includes("RESOURCE_EXHAUSTED")))
+  );
+}
+
+/**
+ * Retry on rate-limit errors with exponential backoff and jitter
+ * (about 1s, 2s, 4s, 8s); any other error is thrown straight away.
+ */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= MAX_RETRIES || !isRateLimited(error)) throw error;
+      const delay = 1000 * 2 ** attempt + Math.random() * 500;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * Run fn over items with at most `concurrency` calls in flight, keeping
+ * results in input order.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Check a campaign-name pattern and turn it into a GAQL string literal.
+ * GAQL uses RE2, which has no lookarounds or backreferences, so those are
+ * rejected here with a clear message instead of failing in every account.
+ */
+function gaqlRegexLiteral(pattern: string): string {
+  if (/\(\?[=!<]|\\[1-9]/.test(pattern)) {
+    throw new Error("name_pattern can't use lookarounds or backreferences (Google Ads uses RE2 regex syntax).");
+  }
+  try {
+    new RegExp(pattern);
+  } catch (error) {
+    throw new Error(`name_pattern is not a valid regular expression: ${error instanceof Error ? error.message : error}`);
+  }
+  // Escape backslashes first, then single quotes, for the GAQL string literal
+  const escaped = `(?i).*(${pattern}).*`.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  return `'${escaped}'`;
+}
+
 function textResult(value: unknown) {
   return {
     content: [
@@ -518,34 +679,48 @@ export async function handleToolCall(
       case "list_accounts": {
         const params = listAccountsSchema.parse(args);
         const mcc = client.loginCustomerId;
-        const where = params.include_inactive ? "" : " WHERE customer_client.status = 'ENABLED'";
-        const { rows, truncated } = await client.search(
-          mcc,
-          `SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.time_zone, customer_client.status, customer_client.manager, customer_client.level, customer_client.test_account FROM customer_client${where}`,
-          10_000
-        );
-        const accounts = rows
-          .map((r) => ({
-            customer_id: String(r["customerClient.id"] ?? ""),
-            name: r["customerClient.descriptiveName"] ?? "",
-            currency: r["customerClient.currencyCode"] ?? "",
-            time_zone: r["customerClient.timeZone"] ?? "",
-            status: r["customerClient.status"] ?? "",
-            is_manager: r["customerClient.manager"] ?? false,
-            level: r["customerClient.level"] ?? 0,
-            test_account: r["customerClient.testAccount"] ?? false,
-          }))
-          .filter((a) => a.customer_id !== mcc)
-          .sort((a, b) => String(a.name).localeCompare(String(b.name)));
-        return textResult({
-          manager_customer_id: mcc,
-          account_count: accounts.length,
-          truncated,
-          note: accounts.length
-            ? "is_manager=true rows are sub-manager accounts; query their client accounts directly by customer_id."
-            : "No client accounts found under this MCC. Check GOOGLE_ADS_LOGIN_CUSTOMER_ID and that the accounts are linked to it.",
-          accounts,
-        });
+        const { accounts: all } = await listClientAccounts(client, params.include_inactive);
+
+        // Every word must appear in the name or ID, ignoring case, spaces,
+        // dashes and punctuation ("smith plumb" matches "Smith & Sons Plumbing")
+        const normalize = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+        const words = params.name_filter ? normalize(params.name_filter).split(" ").filter(Boolean) : [];
+        const matches = words.length
+          ? all.filter((a) => {
+              const haystack = `${normalize(a.name)} ${a.customer_id}`;
+              return words.every((w) => haystack.includes(w));
+            })
+          : all;
+        const truncated = matches.length > params.limit;
+
+        // Compact rows: flags only when they're true, to keep large MCCs small
+        const accounts = matches.slice(0, params.limit).map((a) => ({
+          customer_id: a.customer_id,
+          name: a.name,
+          currency: a.currency,
+          time_zone: a.time_zone,
+          status: a.status,
+          ...(a.is_manager ? { is_manager: true } : {}),
+          ...(a.test_account ? { test_account: true } : {}),
+        }));
+
+        let note: string | undefined;
+        if (all.length === 0) {
+          note = "No client accounts found under this MCC. Check GOOGLE_ADS_LOGIN_CUSTOMER_ID and that the accounts are linked to it.";
+        } else if (matches.length === 0) {
+          note = `No accounts match "${params.name_filter}". Try fewer or shorter words${params.include_inactive ? "" : ", or include_inactive: true"}.`;
+        } else if (truncated) {
+          note = `Showing ${params.limit} of ${matches.length} accounts (sorted by name). Use name_filter to find a specific client, or raise limit (max ${MAX_ROW_LIMIT}).`;
+        } else if (accounts.some((a) => a.is_manager)) {
+          note = "is_manager=true rows are sub-manager accounts; query their client accounts directly by customer_id.";
+        }
+
+        // One account per line: readable, and far smaller than indented JSON
+        const lines = [
+          JSON.stringify({ manager_customer_id: mcc, account_count: matches.length, returned: accounts.length, truncated, note }),
+          ...accounts.map((a) => JSON.stringify(a)),
+        ];
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
       }
 
       case "run_gaql": {
@@ -925,6 +1100,102 @@ export async function handleToolCall(
           returned_rows: Math.min(rows.length, params.limit),
           truncated,
           rows: rows.slice(0, params.limit),
+        });
+      }
+
+      case "search_campaigns": {
+        const params = searchCampaignsSchema.parse(args);
+        if (params.start_date > params.end_date) {
+          throw new Error(`start_date (${params.start_date}) is after end_date (${params.end_date}).`);
+        }
+        const regex = gaqlRegexLiteral(params.name_pattern);
+
+        // Account names and currencies come from the MCC's client list; with
+        // explicit customer_ids, inactive accounts are looked up too
+        const { accounts: allAccounts } = await withRetry(() =>
+          listClientAccounts(client, Boolean(params.customer_ids?.length))
+        );
+        const byId = new Map(allAccounts.map((a) => [a.customer_id, a]));
+        const targets: { customer_id: string; name: string; currency: string }[] = params.customer_ids?.length
+          ? [...new Set(params.customer_ids)].map((id) => ({
+              customer_id: id,
+              name: byId.get(id)?.name ?? "",
+              currency: byId.get(id)?.currency ?? "",
+            }))
+          : allAccounts.filter((a) => !a.is_manager && a.status === "ENABLED");
+
+        const query = [
+          "SELECT campaign.id, campaign.name, campaign.status, metrics.cost_micros, metrics.clicks, metrics.conversions",
+          "FROM campaign",
+          `WHERE segments.date BETWEEN '${params.start_date}' AND '${params.end_date}'`,
+          `AND metrics.cost_micros > ${Math.round(params.min_cost * 1_000_000)}`,
+          `AND ${statusCondition("campaign.status", params.status)}`,
+          `AND campaign.name REGEXP_MATCH ${regex}`,
+          "ORDER BY metrics.cost_micros DESC",
+          "LIMIT 10000",
+        ].join(" ");
+
+        const outcomes = await mapWithConcurrency(targets, SEARCH_CONCURRENCY, async (account) => {
+          try {
+            const { rows } = await withRetry(() => client.search(account.customer_id, query, 10_000));
+            return { account, rows };
+          } catch (error) {
+            return { account, error: friendlyAdsError(error) };
+          }
+        });
+
+        const matches = outcomes.flatMap((o) =>
+          (o.rows || []).map((r) => {
+            const cost = micros(r["metrics.costMicros"] ?? 0) ?? 0;
+            const conversions = Number(r["metrics.conversions"] ?? 0);
+            return {
+              account_id: o.account.customer_id,
+              account_name: o.account.name,
+              currency: o.account.currency || null,
+              campaign_id: r["campaign.id"],
+              campaign: r["campaign.name"],
+              status: r["campaign.status"],
+              cost,
+              clicks: r["metrics.clicks"] ?? 0,
+              conversions: round(conversions),
+              cost_per_conversion: conversions > 0 ? round(cost / conversions) : null,
+            };
+          })
+        );
+        matches.sort((a, b) => b.cost - a.cost);
+
+        // Accounts can use different currencies, so spend is totalled per currency
+        const spendByCurrency: Record<string, number> = {};
+        for (const m of matches) {
+          const key = m.currency || "unknown";
+          spendByCurrency[key] = round((spendByCurrency[key] ?? 0) + m.cost) ?? 0;
+        }
+        const errored = outcomes
+          .filter((o) => o.error)
+          .map((o) => ({ account_id: o.account.customer_id, account_name: o.account.name, error: o.error }));
+        const truncated = matches.length > params.limit;
+
+        return textResult({
+          summary: {
+            pattern: params.name_pattern,
+            date_range: `${params.start_date} to ${params.end_date}`,
+            accounts_searched: targets.length,
+            accounts_with_matches: new Set(matches.map((m) => m.account_id)).size,
+            accounts_errored: errored.length,
+            matching_campaigns: matches.length,
+            total_spend: spendByCurrency,
+            errors: errored.length ? errored : undefined,
+          },
+          returned_rows: Math.min(matches.length, params.limit),
+          truncated,
+          note: truncated
+            ? `Showing the top ${params.limit} campaigns by cost; summary totals cover all ${matches.length}. Raise limit (max ${MAX_ROW_LIMIT}) or min_cost to see more.`
+            : targets.length === 0
+              ? "No accounts to search: no ENABLED, non-manager client accounts were found under the MCC."
+              : matches.length === 0
+                ? "No campaigns matched this pattern with spend above min_cost in the date range."
+                : undefined,
+          campaigns: matches.slice(0, params.limit),
         });
       }
 

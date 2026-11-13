@@ -8,6 +8,7 @@ A read-only [Model Context Protocol](https://modelcontextprotocol.io) server tha
 - "Compare ad group CTR this month vs last month for the Brand campaign"
 - "What changed in this account in the last two weeks, and could it explain the drop in calls?"
 - "What's our cost per lead for phone calls vs form fills by campaign last month?"
+- "Find every Christmas or holiday campaign across all clients last December and what each spent"
 
 It is **read-only**. Google offers no read-only Ads scope, so the token uses `https://www.googleapis.com/auth/adwords`, but the server only calls the read-only `googleAds:searchStream` and `customers:listAccessibleCustomers` endpoints, refuses to call any other endpoint, has no mutate code at all, and `run_gaql` rejects anything that isn't a `SELECT`. For a guarantee enforced by Google, create the refresh token with a Google user that has **Read only** access to the MCC (step 2).
 
@@ -17,7 +18,7 @@ It is **read-only**. Google offers no read-only Ads scope, so the token uses `ht
 
 | Tool | What it does |
 | --- | --- |
-| `list_accounts` | Client accounts under the MCC: customer ID, name, currency, time zone, status |
+| `list_accounts` | Client accounts under the MCC: customer ID, name, currency, time zone, status. `name_filter` finds a client by name words or ID; returns 100 accounts by default (max 1000) |
 | `run_gaql` | Any read-only GAQL `SELECT` query against one account; rows returned as JSON |
 | `campaign_performance` | Per campaign: status, impressions, clicks, cost, conversions, conversion value, CTR, avg CPC, cost/conv |
 | `ad_group_performance` | Same metrics per ad group (optionally one campaign) |
@@ -26,6 +27,7 @@ It is **read-only**. Google offers no read-only Ads scope, so the token uses `ht
 | `ad_performance` | Ads with type, status, approval status, ad strength, final URL, headlines/descriptions, plus performance metrics |
 | `conversion_breakdown` | Conversions per conversion action (calls, forms, ...) per campaign, with cost per conversion for each: true cost per lead |
 | `change_history` | Who changed what and when (last 30 days max), with old and new values for each changed field |
+| `search_campaigns` | Finds campaigns by name (case-insensitive regex, e.g. `christmas\|holiday`) across every enabled client account under the MCC, in parallel; one list sorted by cost, plus a summary of accounts searched, accounts that errored, and total spend per currency |
 
 Details:
 
